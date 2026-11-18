@@ -1,0 +1,124 @@
+{
+  "entities": {
+    "StudyPack": {
+      "title": "StudyPack",
+      "description": "An AI-generated academic study package including notes, mind maps, quizzes, and summaries",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 300 },
+        "subject": { "type": "string", "maxLength": 200 },
+        "createdAt": { "type": "string" },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "isFavorite": { "type": "boolean" },
+        "isDemo": { "type": "boolean" },
+        "sourceType": { "type": "string" },
+        "sourceName": { "type": "string", "maxLength": 300 },
+        "summary": { "type": "object" },
+        "keyPoints": { "type": "array" },
+        "definitions": { "type": "array" },
+        "concepts": { "type": "array" },
+        "handwrittenNotes": { "type": "array" },
+        "mindMap": { "type": "object" },
+        "quiz": { "type": "array" },
+        "shortQuestions": { "type": "array" },
+        "caseQuestions": { "type": "array" },
+        "vivaQuestions": { "type": "array" },
+        "examImportantTopics": { "type": "array" },
+        "youtubeResources": { "type": "array" },
+        "studyPlan": { "type": "array" }
+      },
+      "required": ["id", "title", "ownerId", "createdAt"]
+    },
+    "UserStats": {
+      "title": "UserStats",
+      "description": "User learning statistics, streak, and quiz accuracy",
+      "type": "object",
+      "properties": {
+        "packsCreated": { "type": "number" },
+        "quizzesCompleted": { "type": "number" },
+        "totalQuizScoreSum": { "type": "number" },
+        "totalQuizQuestionsSum": { "type": "number" },
+        "topicsStudied": { "type": "array" },
+        "weakTopics": { "type": "array" },
+        "studyStreakDays": { "type": "number" },
+        "lastStudyDate": { "type": "string" }
+      },
+      "required": ["packsCreated", "quizzesCompleted"]
+    },
+    "CaseStudy": {
+      "title": "CaseStudy",
+      "description": "Interactive real-world case study with student submissions, 100-point rubric evaluations, and adaptive follow-up questions",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "studyPackId": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 300 },
+        "topic": { "type": "string", "maxLength": 300 },
+        "subject": { "type": "string", "maxLength": 200 },
+        "difficulty": { "type": "string" },
+        "caseType": { "type": "string" },
+        "status": { "type": "string" },
+        "isSaved": { "type": "boolean" },
+        "isBookmarked": { "type": "boolean" },
+        "latestScore": { "type": "number" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "title", "topic", "ownerId", "status", "createdAt", "updatedAt"]
+    },
+    "PodcastEpisode": {
+      "title": "PodcastEpisode",
+      "description": "AI educational podcast metadata, multi-speaker script, chapters, learning tools, and playback progress",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "studyPackId": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 300 },
+        "topic": { "type": "string", "maxLength": 300 },
+        "format": { "type": "string" },
+        "language": { "type": "string" },
+        "audioDurationSec": { "type": "number" },
+        "playbackProgressSec": { "type": "number" },
+        "isCompleted": { "type": "boolean" },
+        "isSaved": { "type": "boolean" },
+        "isBookmarked": { "type": "boolean" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "title", "topic", "ownerId", "createdAt", "updatedAt"]
+    },
+    "TestConnection": {
+      "title": "TestConnection",
+      "description": "Connection probe document to verify Firestore readiness",
+      "type": "object",
+      "properties": {
+        "status": { "type": "string" }
+      }
+    }
+  },
+  "firestore": {
+    "/users/{userId}/studyPacks/{packId}": {
+      "schema": { "$ref": "#/entities/StudyPack" },
+      "description": "User private study packs"
+    },
+    "/users/{userId}/caseStudies/{caseId}": {
+      "schema": { "$ref": "#/entities/CaseStudy" },
+      "description": "User interactive case studies and performance history"
+    },
+    "/users/{userId}/podcasts/{podcastId}": {
+      "schema": { "$ref": "#/entities/PodcastEpisode" },
+      "description": "User Listen & Learn podcast episodes and playback progress"
+    },
+    "/users/{userId}/stats/overview": {
+      "schema": { "$ref": "#/entities/UserStats" },
+      "description": "User academic study statistics"
+    },
+    "/test/connection": {
+      "schema": { "$ref": "#/entities/TestConnection" },
+      "description": "Probe path to verify database connection"
+    }
+  }
+}

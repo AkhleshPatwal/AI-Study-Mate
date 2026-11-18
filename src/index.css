@@ -1,0 +1,92 @@
+@import "tailwindcss";
+
+@variant dark (&:is(.dark, .dark *));
+@custom-variant dark (&:is(.dark, .dark *));
+
+@layer utilities {
+  .font-handwriting {
+    font-family: 'Kalam', 'Caveat', cursive, sans-serif;
+  }
+  .font-sans-academic {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  }
+}
+
+/* Base dark mode styles */
+html.dark {
+  color-scheme: dark;
+}
+
+html.dark body {
+  background-color: #020617;
+  color: #f8fafc;
+}
+
+/* Notebook paper simulation */
+.notebook-paper-light {
+  background-color: #fffef9;
+  background-image: 
+    linear-gradient(90deg, transparent 72px, #fca5a5 72px, #fca5a5 74px, transparent 74px),
+    linear-gradient(#e2e8f0 1px, transparent 1px);
+  background-size: 100% 100%, 100% 32px;
+  line-height: 32px;
+}
+
+.notebook-paper-dark {
+  background-color: #1a1f2c;
+  background-image: 
+    linear-gradient(90deg, transparent 72px, #991b1b 72px, #991b1b 74px, transparent 74px),
+    linear-gradient(#334155 1px, transparent 1px);
+  background-size: 100% 100%, 100% 32px;
+  line-height: 32px;
+}
+
+/* Highlighter pens */
+.highlight-yellow {
+  background: linear-gradient(104deg, rgba(254, 240, 138, 0.4) 0%, rgba(254, 240, 138, 0.85) 5%, rgba(254, 240, 138, 0.75) 95%);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.highlight-pink {
+  background: linear-gradient(104deg, rgba(251, 207, 232, 0.4) 0%, rgba(251, 207, 232, 0.85) 5%, rgba(251, 207, 232, 0.75) 95%);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.highlight-cyan {
+  background: linear-gradient(104deg, rgba(186, 230, 253, 0.4) 0%, rgba(186, 230, 253, 0.85) 5%, rgba(186, 230, 253, 0.75) 95%);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.highlight-green {
+  background: linear-gradient(104deg, rgba(187, 247, 208, 0.4) 0%, rgba(187, 247, 208, 0.85) 5%, rgba(187, 247, 208, 0.75) 95%);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.hand-underline-blue {
+  text-decoration: underline wavy #3b82f6;
+  text-underline-offset: 4px;
+}
+
+.hand-underline-red {
+  text-decoration: underline wavy #ef4444;
+  text-underline-offset: 4px;
+}
+
+/* Print utilities */
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  .print-area {
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+  }
+  body {
+    background-color: #ffffff !important;
+    color: #000000 !important;
+  }
+}
+

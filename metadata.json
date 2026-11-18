@@ -1,0 +1,6 @@
+{
+  "name": "AI StudyMate",
+  "description": "Turn your study material into everything you need to learn, revise and prepare. AI-powered study assistant generating handwritten-style notes, mind maps, quizzes, summaries, and exam prep for students.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
