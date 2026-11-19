@@ -225,6 +225,16 @@ function stripUndefined<T>(obj: T): T {
   return obj;
 }
 
+function sanitizeFirestoreId(rawId: string): string {
+  const cleaned = String(rawId || `doc-${Date.now()}`).replace(/[^a-zA-Z0-9_-]/g, '-');
+  return cleaned.slice(0, 128) || `doc-${Date.now()}`;
+}
+
+function clampString(val: unknown, maxLen: number, fallback = ''): string {
+  const str = typeof val === 'string' ? val : fallback;
+  return str.length > maxLen ? str.slice(0, maxLen) : str;
+}
+
 // Connection test on boot (CRITICAL from skill specification)
 export async function testConnection(): Promise<boolean> {
   try {
@@ -297,14 +307,20 @@ export async function signOutUser(): Promise<void> {
 
 // Database Actions for StudyPacks
 export async function saveStudyPackToFirestore(userId: string, pack: StudyPack): Promise<void> {
-  const docPath = `users/${userId}/studyPacks/${pack.id}`;
+  const safeId = sanitizeFirestoreId(pack.id);
+  const docPath = `users/${userId}/studyPacks/${safeId}`;
   try {
     const dataToSave = stripUndefined({
       ...pack,
+      id: safeId,
+      title: clampString(pack.title, 300, 'Untitled Study Pack'),
+      subject: clampString(pack.subject, 200, 'General'),
+      sourceName: pack.sourceName ? clampString(pack.sourceName, 300) : undefined,
+      createdAt: clampString(pack.createdAt, 64, new Date().toISOString()),
       ownerId: userId,
       updatedAt: new Date().toISOString(),
     });
-    await setDoc(doc(db, 'users', userId, 'studyPacks', pack.id), dataToSave);
+    await setDoc(doc(db, 'users', userId, 'studyPacks', safeId), dataToSave);
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, docPath);
   }
@@ -361,14 +377,21 @@ export function subscribeToStudyPacks(
 
 // Database Actions for Case Studies
 export async function saveCaseStudyToFirestore(userId: string, cs: CaseStudy): Promise<void> {
-  const docPath = `users/${userId}/caseStudies/${cs.id}`;
+  const safeId = sanitizeFirestoreId(cs.id);
+  const docPath = `users/${userId}/caseStudies/${safeId}`;
   try {
+    const nowIso = new Date().toISOString();
     const dataToSave = stripUndefined({
       ...cs,
+      id: safeId,
+      title: clampString(cs.title, 300, 'Untitled Case Study'),
+      topic: clampString(cs.topic, 300, 'General Case'),
+      subject: clampString(cs.subject, 200, 'General'),
+      createdAt: clampString(cs.createdAt, 64, nowIso),
       ownerId: userId,
-      updatedAt: new Date().toISOString(),
+      updatedAt: clampString(nowIso, 64, nowIso),
     });
-    await setDoc(doc(db, 'users', userId, 'caseStudies', cs.id), dataToSave);
+    await setDoc(doc(db, 'users', userId, 'caseStudies', safeId), dataToSave);
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, docPath);
   }
@@ -414,14 +437,20 @@ export async function savePodcastToFirestore(
   userId: string,
   podcast: PodcastEpisode
 ): Promise<void> {
-  const docPath = `users/${userId}/podcasts/${podcast.id}`;
+  const safeId = sanitizeFirestoreId(podcast.id);
+  const docPath = `users/${userId}/podcasts/${safeId}`;
   try {
+    const nowIso = new Date().toISOString();
     const dataToSave = stripUndefined({
       ...podcast,
+      id: safeId,
+      title: clampString(podcast.title, 300, 'Untitled Episode'),
+      topic: clampString(podcast.topic, 300, 'General Topic'),
+      createdAt: clampString(podcast.createdAt, 64, nowIso),
       ownerId: userId,
-      updatedAt: new Date().toISOString(),
+      updatedAt: clampString(nowIso, 64, nowIso),
     });
-    await setDoc(doc(db, 'users', userId, 'podcasts', podcast.id), dataToSave);
+    await setDoc(doc(db, 'users', userId, 'podcasts', safeId), dataToSave);
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, docPath);
   }

@@ -31,7 +31,7 @@ service cloud.firestore {
       return data.id is string && data.id.size() <= 128 &&
              data.title is string && data.title.size() <= 300 &&
              data.ownerId == userId &&
-             data.createdAt is string;
+             data.createdAt is string && data.createdAt.size() <= 64;
     }
 
     function isValidUserStats(data) {
