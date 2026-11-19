@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
 import {
   StudyPack,
   UserStats,
@@ -12,6 +12,8 @@ import { DEMO_STUDY_PACK } from '../data/demoStudyPack';
 import { User, onAuthStateChanged } from 'firebase/auth';
 import {
   auth,
+  AuthErrorDetails,
+  classifyFirebaseAuthError,
   testConnection as testDbConnection,
   signInWithGoogle,
   signOutUser,
@@ -28,6 +30,17 @@ import {
   loadUserStatsFromFirestore,
 } from '../services/firebase';
 import { deletePodcastAudioBlob } from '../services/audioCache';
+import {
+  enqueuePendingSyncOp,
+  isIndexedDbAvailable,
+  loadOfflineCacheSnapshot,
+  QueuedSyncOp,
+  saveAllCaseStudiesToIdb,
+  saveAllPodcastsToIdb,
+  saveAllStudyPacksToIdb,
+  saveStatsToIdb,
+  setPendingSyncOps,
+} from '../services/offlineCache';
 import {
   getStoredGeminiKey,
   saveStoredGeminiKey,
@@ -124,11 +137,18 @@ interface StudyContextType {
   isAuthModalOpen: boolean;
   setIsAuthModalOpen: (open: boolean) => void;
   authError: string | null;
+  authErrorDetails: AuthErrorDetails | null;
+  authRetryStatus: string | null;
   clearAuthError: () => void;
-  // Database & User Auth
+  // Database & User Auth & Offline Cache
   user: User | null;
   isAuthLoading: boolean;
   isDbConnected: boolean;
+  isOnline: boolean;
+  isOfflineCacheReady: boolean;
+  lastOfflineCachedAt: string | null;
+  pendingOfflineSyncCount: number;
+  syncOfflineCacheNow: () => Promise<void>;
   loginWithGoogle: () => Promise<boolean>;
   logout: () => Promise<void>;
 }
@@ -168,11 +188,21 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState(false);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [authErrorDetails, setAuthErrorDetails] = useState<AuthErrorDetails | null>(null);
+  const [authRetryStatus, setAuthRetryStatus] = useState<string | null>(null);
 
-  // User Auth & Database Connection states
+  // User Auth & Database Connection & Offline Cache states
   const [user, setUser] = useState<User | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [isDbConnected, setIsDbConnected] = useState(false);
+  const [isOnline, setIsOnline] = useState<boolean>(() =>
+    typeof navigator !== 'undefined' ? navigator.onLine : true
+  );
+  const [isOfflineCacheReady, setIsOfflineCacheReady] = useState<boolean>(() =>
+    !isIndexedDbAvailable()
+  );
+  const [lastOfflineCachedAt, setLastOfflineCachedAt] = useState<string | null>(null);
+  const [pendingOfflineSyncCount, setPendingOfflineSyncCount] = useState<number>(0);
 
   // Settings
   const [geminiKey, setGeminiKey] = useState<string>(() => getStoredGeminiKey());
@@ -258,6 +288,218 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   });
   const [podcastPrefill, setPodcastPrefill] = useState<PodcastPrefillContext | null>(null);
 
+  // Keep refs synchronized so onAuthStateChanged always syncs the latest guest items (no stale closure)
+  const savedPacksRef = useRef(savedPacks);
+  const caseStudiesRef = useRef(caseStudies);
+  const podcastsRef = useRef(podcasts);
+  const statsRef = useRef(stats);
+  const authEventSeqRef = useRef(0);
+  const idbHydratedRef = useRef(false);
+
+  useEffect(() => {
+    savedPacksRef.current = savedPacks;
+  }, [savedPacks]);
+  useEffect(() => {
+    caseStudiesRef.current = caseStudies;
+  }, [caseStudies]);
+  useEffect(() => {
+    podcastsRef.current = podcasts;
+  }, [podcasts]);
+  useEffect(() => {
+    statsRef.current = stats;
+  }, [stats]);
+
+  // Execute a queued cloud op against Firestore
+  const executeCloudOp = async (op: Omit<QueuedSyncOp, 'id' | 'queuedAt'>): Promise<void> => {
+    switch (op.type) {
+      case 'upsert_pack':
+        await saveStudyPackToFirestore(op.userId, op.payload as StudyPack);
+        return;
+      case 'delete_pack':
+        await deleteStudyPackFromFirestore(op.userId, String(op.payload.id));
+        return;
+      case 'upsert_case':
+        await saveCaseStudyToFirestore(op.userId, op.payload as CaseStudy);
+        return;
+      case 'delete_case':
+        await deleteCaseStudyFromFirestore(op.userId, String(op.payload.id));
+        return;
+      case 'upsert_podcast':
+        await savePodcastToFirestore(op.userId, op.payload as PodcastEpisode);
+        return;
+      case 'delete_podcast':
+        await deletePodcastFromFirestore(op.userId, String(op.payload.id));
+        return;
+      case 'save_stats':
+        await saveUserStatsToFirestore(op.userId, op.payload as UserStats);
+        return;
+    }
+  };
+
+  const syncCloudOrQueue = (op: Omit<QueuedSyncOp, 'id' | 'queuedAt'>) => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      enqueuePendingSyncOp(op).then((next) => setPendingOfflineSyncCount(next.length));
+      return;
+    }
+    executeCloudOp(op).catch((err) => {
+      console.warn('Firestore write deferred to offline sync queue:', err?.message || err);
+      enqueuePendingSyncOp(op).then((next) => setPendingOfflineSyncCount(next.length));
+    });
+  };
+
+  const flushPendingSyncQueue = async (targetUserId: string) => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+    const snapshot = await loadOfflineCacheSnapshot();
+    const pending = snapshot.pendingOps;
+    if (pending.length === 0) {
+      setPendingOfflineSyncCount(0);
+      return;
+    }
+
+    const remaining: QueuedSyncOp[] = [];
+    for (const op of pending) {
+      if (op.userId !== targetUserId) {
+        remaining.push(op);
+        continue;
+      }
+      try {
+        await executeCloudOp(op);
+      } catch {
+        remaining.push(op);
+      }
+    }
+
+    await setPendingSyncOps(remaining);
+    setPendingOfflineSyncCount(remaining.length);
+  };
+
+  const syncOfflineCacheNow = async () => {
+    await Promise.all([
+      saveAllStudyPacksToIdb(savedPacksRef.current),
+      saveAllCaseStudiesToIdb(caseStudiesRef.current),
+      saveAllPodcastsToIdb(podcastsRef.current),
+      saveStatsToIdb(statsRef.current),
+    ]);
+    setLastOfflineCachedAt(new Date().toISOString());
+    if (user && (typeof navigator === 'undefined' || navigator.onLine)) {
+      await flushPendingSyncQueue(user.uid);
+    }
+  };
+
+  // Monitor browser online/offline transitions
+  useEffect(() => {
+    const handleOnline = () => {
+      setIsOnline(true);
+      testDbConnection().then((ok) => setIsDbConnected(ok));
+      if (auth.currentUser) {
+        flushPendingSyncQueue(auth.currentUser.uid).catch(() => {});
+      }
+    };
+    const handleOffline = () => {
+      setIsOnline(false);
+    };
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  // Hydrate study packs, case studies, podcasts, and stats from IndexedDB on boot
+  useEffect(() => {
+    let active = true;
+    loadOfflineCacheSnapshot()
+      .then(async (snap) => {
+        if (!active) return;
+
+        if (snap.packs.length > 0) {
+          const map = new Map<string, StudyPack>();
+          snap.packs.forEach((p) => map.set(p.id, p));
+          savedPacksRef.current.forEach((p) => {
+            if (!map.has(p.id)) map.set(p.id, p);
+          });
+          const mergedPacks = Array.from(map.values());
+          setSavedPacks(mergedPacks);
+          setCurrentPack((prev) => {
+            if (!prev || prev.isDemo) {
+              return mergedPacks.find((p) => !p.isDemo) || mergedPacks[0] || prev;
+            }
+            return mergedPacks.find((p) => p.id === prev.id) || prev;
+          });
+        } else {
+          await saveAllStudyPacksToIdb(savedPacksRef.current);
+        }
+
+        if (snap.caseStudies.length > 0) {
+          const map = new Map<string, CaseStudy>();
+          snap.caseStudies.forEach((c) => map.set(c.id, c));
+          caseStudiesRef.current.forEach((c) => {
+            if (!map.has(c.id)) map.set(c.id, c);
+          });
+          const mergedCases = Array.from(map.values()).sort(
+            (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+          );
+          setCaseStudies(mergedCases);
+          setActiveCaseStudy((prev) => prev || mergedCases[0] || null);
+        } else if (caseStudiesRef.current.length > 0) {
+          await saveAllCaseStudiesToIdb(caseStudiesRef.current);
+        }
+
+        if (snap.podcasts.length > 0) {
+          const map = new Map<string, PodcastEpisode>();
+          snap.podcasts.forEach((ep) => map.set(ep.id, ep));
+          podcastsRef.current.forEach((ep) => {
+            if (!map.has(ep.id)) map.set(ep.id, ep);
+          });
+          const mergedPods = Array.from(map.values()).sort(
+            (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+          );
+          setPodcasts(mergedPods);
+          setActivePodcast((prev) => prev || mergedPods[0] || null);
+        } else if (podcastsRef.current.length > 0) {
+          await saveAllPodcastsToIdb(podcastsRef.current);
+        }
+
+        if (snap.stats) {
+          setStats((prev) => ({
+            ...INITIAL_STATS,
+            ...prev,
+            ...snap.stats,
+            packsCreated: Math.max(prev.packsCreated || 0, snap.stats?.packsCreated || 0),
+            quizzesCompleted: Math.max(
+              prev.quizzesCompleted || 0,
+              snap.stats?.quizzesCompleted || 0
+            ),
+            caseStudiesCompleted: Math.max(
+              prev.caseStudiesCompleted || 0,
+              snap.stats?.caseStudiesCompleted || 0
+            ),
+            podcastsCreated: Math.max(
+              prev.podcastsCreated || 0,
+              snap.stats?.podcastsCreated || 0
+            ),
+          }));
+        } else {
+          await saveStatsToIdb(statsRef.current);
+        }
+
+        setPendingOfflineSyncCount(snap.pendingOps.length);
+        setLastOfflineCachedAt(snap.lastCachedAt || new Date().toISOString());
+        idbHydratedRef.current = true;
+        setIsOfflineCacheReady(true);
+      })
+      .catch((err) => {
+        console.warn('IndexedDB hydration skipped:', err);
+        idbHydratedRef.current = true;
+        setIsOfflineCacheReady(true);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
   // Test Firestore connection on boot (Skill mandate)
   useEffect(() => {
     testDbConnection().then((ok) => {
@@ -267,33 +509,51 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
   // Listen to Firebase Auth state & attach real-time Firestore listeners
   useEffect(() => {
+    let isMounted = true;
     let unsubscribePacks: (() => void) | null = null;
     let unsubscribeCases: (() => void) | null = null;
     let unsubscribePodcasts: (() => void) | null = null;
 
+    const cleanupListeners = () => {
+      if (unsubscribePacks) {
+        unsubscribePacks();
+        unsubscribePacks = null;
+      }
+      if (unsubscribeCases) {
+        unsubscribeCases();
+        unsubscribeCases = null;
+      }
+      if (unsubscribePodcasts) {
+        unsubscribePodcasts();
+        unsubscribePodcasts = null;
+      }
+    };
+
+    // Safety guard so initial button spinner never hangs if auth SDK stalls offline
+    const authBootTimeout = window.setTimeout(() => {
+      if (isMounted) {
+        setIsAuthLoading(false);
+      }
+    }, 4000);
+
     const unsubscribeAuth = onAuthStateChanged(auth, async (currentUser) => {
+      window.clearTimeout(authBootTimeout);
+      const eventSeq = ++authEventSeqRef.current;
+
+      if (!isMounted) return;
+
+      // Always tear down previous user's listeners immediately before re-attaching
+      cleanupListeners();
+
       setUser(currentUser);
       setIsAuthLoading(false);
 
       if (currentUser) {
-        // Upload local items to cloud if present
-        try {
-          for (const pack of savedPacks) {
-            if (!pack.isDemo) {
-              await saveStudyPackToFirestore(currentUser.uid, pack);
-            }
-          }
-          for (const cs of caseStudies) {
-            await saveCaseStudyToFirestore(currentUser.uid, cs);
-          }
-          for (const ep of podcasts) {
-            await savePodcastToFirestore(currentUser.uid, ep);
-          }
-        } catch (e) {
-          console.error('Error syncing local items with Firestore:', e);
-        }
+        setAuthError(null);
+        setAuthErrorDetails(null);
+        setAuthRetryStatus(null);
 
-        // Subscribe to real-time updates for Study Packs
+        // Attach real-time Firestore listeners immediately (merge safely with local state)
         unsubscribePacks = subscribeToStudyPacks(
           currentUser.uid,
           (cloudPacks) => {
@@ -310,7 +570,6 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           (err) => console.error('StudyPacks snapshot error:', err)
         );
 
-        // Subscribe to real-time updates for Case Studies
         unsubscribeCases = subscribeToCaseStudies(
           currentUser.uid,
           (cloudCases) => {
@@ -328,7 +587,6 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           (err) => console.error('CaseStudies snapshot error:', err)
         );
 
-        // Subscribe to real-time updates for Podcasts
         unsubscribePodcasts = subscribeToPodcasts(
           currentUser.uid,
           (cloudEpisodes) => {
@@ -346,38 +604,45 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           (err) => console.error('Podcasts snapshot error:', err)
         );
 
-        // Load stats from Firestore
+        // Upload latest local guest items in resilient parallel batch without blocking listeners
+        const syncTasks: Promise<void>[] = [
+          ...savedPacksRef.current
+            .filter((pack) => !pack.isDemo)
+            .map((pack) => saveStudyPackToFirestore(currentUser.uid, pack)),
+          ...caseStudiesRef.current.map((cs) => saveCaseStudyToFirestore(currentUser.uid, cs)),
+          ...podcastsRef.current.map((ep) => savePodcastToFirestore(currentUser.uid, ep)),
+        ];
+
+        Promise.allSettled(syncTasks).then((results) => {
+          const rejected = results.filter((r) => r.status === 'rejected');
+          if (rejected.length > 0) {
+            console.warn(`${rejected.length} local study item(s) could not sync to Firestore.`);
+          }
+        });
+
+        // Also flush any queued offline mutations created while disconnected
+        flushPendingSyncQueue(currentUser.uid).catch(() => {});
+
+        // Sync stats without overwriting newer cloud stats
         try {
           const cloudStats = await loadUserStatsFromFirestore(currentUser.uid);
+          if (!isMounted || authEventSeqRef.current !== eventSeq) return;
           if (cloudStats) {
             setStats({ ...INITIAL_STATS, ...cloudStats });
           } else {
-            await saveUserStatsToFirestore(currentUser.uid, stats);
+            await saveUserStatsToFirestore(currentUser.uid, statsRef.current);
           }
         } catch (e) {
           console.error('Error syncing stats with Firestore:', e);
-        }
-      } else {
-        if (unsubscribePacks) {
-          unsubscribePacks();
-          unsubscribePacks = null;
-        }
-        if (unsubscribeCases) {
-          unsubscribeCases();
-          unsubscribeCases = null;
-        }
-        if (unsubscribePodcasts) {
-          unsubscribePodcasts();
-          unsubscribePodcasts = null;
         }
       }
     });
 
     return () => {
+      isMounted = false;
+      window.clearTimeout(authBootTimeout);
+      cleanupListeners();
       unsubscribeAuth();
-      if (unsubscribePacks) unsubscribePacks();
-      if (unsubscribeCases) unsubscribeCases();
-      if (unsubscribePodcasts) unsubscribePodcasts();
     };
   }, []);
 
@@ -401,35 +666,53 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     } catch {}
   }, [theme]);
 
-  // Sync saved packs to localStorage
+  // Sync saved packs to IndexedDB (primary offline storage) + localStorage fallback
   useEffect(() => {
+    if (idbHydratedRef.current) {
+      saveAllStudyPacksToIdb(savedPacks).then(() => {
+        setLastOfflineCachedAt(new Date().toISOString());
+      });
+    }
     try {
       localStorage.setItem(LOCAL_STORAGE_PACKS_KEY, JSON.stringify(savedPacks));
     } catch (e) {
-      console.error('Failed to persist packs to localStorage', e);
+      console.warn('localStorage pack quota reached; cached safely in IndexedDB.', e);
     }
   }, [savedPacks]);
 
-  // Sync case studies to localStorage
+  // Sync case studies to IndexedDB + localStorage fallback
   useEffect(() => {
+    if (idbHydratedRef.current) {
+      saveAllCaseStudiesToIdb(caseStudies).then(() => {
+        setLastOfflineCachedAt(new Date().toISOString());
+      });
+    }
     try {
       localStorage.setItem(LOCAL_STORAGE_CASES_KEY, JSON.stringify(caseStudies));
     } catch (e) {
-      console.error('Failed to persist case studies to localStorage', e);
+      console.warn('localStorage case study quota reached; cached safely in IndexedDB.', e);
     }
   }, [caseStudies]);
 
-  // Sync podcasts to localStorage
+  // Sync podcasts to IndexedDB + localStorage fallback
   useEffect(() => {
+    if (idbHydratedRef.current) {
+      saveAllPodcastsToIdb(podcasts).then(() => {
+        setLastOfflineCachedAt(new Date().toISOString());
+      });
+    }
     try {
       localStorage.setItem(LOCAL_STORAGE_PODCASTS_KEY, JSON.stringify(podcasts));
     } catch (e) {
-      console.error('Failed to persist podcasts to localStorage', e);
+      console.warn('localStorage podcast quota reached; cached safely in IndexedDB.', e);
     }
   }, [podcasts]);
 
-  // Sync stats
+  // Sync stats to IndexedDB + localStorage
   useEffect(() => {
+    if (idbHydratedRef.current) {
+      saveStatsToIdb(stats);
+    }
     try {
       localStorage.setItem(LOCAL_STORAGE_STATS_KEY, JSON.stringify(stats));
     } catch (e) {
@@ -486,29 +769,35 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     return res.success;
   };
 
-  const clearAuthError = () => setAuthError(null);
+  const clearAuthError = () => {
+    setAuthError(null);
+    setAuthErrorDetails(null);
+    setAuthRetryStatus(null);
+  };
 
   const loginWithGoogle = async (): Promise<boolean> => {
     setIsAuthLoading(true);
     setAuthError(null);
+    setAuthErrorDetails(null);
+    setAuthRetryStatus(null);
     try {
-      const loggedUser = await signInWithGoogle();
+      const loggedUser = await signInWithGoogle({
+        onRetryAttempt: (attempt, maxAttempts) => {
+          setAuthRetryStatus(
+            `Temporary connection hiccup — retrying (${attempt}/${maxAttempts})...`
+          );
+        },
+      });
+      setAuthRetryStatus(null);
       setIsAuthLoading(false);
       return Boolean(loggedUser);
     } catch (err: any) {
-      console.error('Google Login Error:', err);
+      const details = classifyFirebaseAuthError(err);
+      console.error('Google Login Error:', details.code, err);
+      setAuthRetryStatus(null);
       setIsAuthLoading(false);
-      let message = 'Google sign-in could not be completed. Please try again.';
-      if (err?.code === 'auth/popup-closed-by-user') {
-        message = 'The Google sign-in window was closed before completing.';
-      } else if (err?.code === 'auth/popup-blocked') {
-        message = 'The sign-in popup was blocked. Please allow popups for this page in your browser.';
-      } else if (err?.code === 'auth/cancelled-popup-request') {
-        message = 'Previous sign-in request was cancelled.';
-      } else if (err?.message) {
-        message = err.message;
-      }
-      setAuthError(message);
+      setAuthError(details.message);
+      setAuthErrorDetails(details);
       return false;
     }
   };
@@ -544,13 +833,13 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           : [pack.title, ...prev.topicsStudied],
       };
       if (user) {
-        saveUserStatsToFirestore(user.uid, updated).catch(console.error);
+        syncCloudOrQueue({ userId: user.uid, type: 'save_stats', payload: updated });
       }
       return updated;
     });
 
     if (user && !pack.isDemo) {
-      saveStudyPackToFirestore(user.uid, pack).catch(console.error);
+      syncCloudOrQueue({ userId: user.uid, type: 'upsert_pack', payload: pack });
     }
   };
 
@@ -564,7 +853,7 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     });
 
     if (user) {
-      deleteStudyPackFromFirestore(user.uid, id).catch(console.error);
+      syncCloudOrQueue({ userId: user.uid, type: 'delete_pack', payload: { id } });
     }
   };
 
@@ -573,7 +862,7 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       const updated = prev.map((p) => (p.id === id ? { ...p, isFavorite: !p.isFavorite } : p));
       const targetPack = updated.find((p) => p.id === id);
       if (user && targetPack && !targetPack.isDemo) {
-        saveStudyPackToFirestore(user.uid, targetPack).catch(console.error);
+        syncCloudOrQueue({ userId: user.uid, type: 'upsert_pack', payload: targetPack });
       }
       return updated;
     });
@@ -608,7 +897,7 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         recentActivities: [entry, ...(prev.recentActivities || [])].slice(0, 15),
       };
       if (user) {
-        saveUserStatsToFirestore(user.uid, next).catch(console.error);
+        syncCloudOrQueue({ userId: user.uid, type: 'save_stats', payload: next });
       }
       return next;
     });
@@ -670,7 +959,7 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       };
 
       if (user) {
-        saveUserStatsToFirestore(user.uid, newStats).catch(console.error);
+        syncCloudOrQueue({ userId: user.uid, type: 'save_stats', payload: newStats });
       }
 
       return newStats;
@@ -710,13 +999,15 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             ...(prev.recentActivities || []),
           ].slice(0, 15),
         };
-        if (user) saveUserStatsToFirestore(user.uid, nextStats).catch(console.error);
+        if (user) {
+          syncCloudOrQueue({ userId: user.uid, type: 'save_stats', payload: nextStats });
+        }
         return nextStats;
       });
     }
 
     if (user) {
-      saveCaseStudyToFirestore(user.uid, stamped).catch(console.error);
+      syncCloudOrQueue({ userId: user.uid, type: 'upsert_case', payload: stamped });
     }
   };
 
@@ -729,7 +1020,7 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       return next;
     });
     if (user) {
-      deleteCaseStudyFromFirestore(user.uid, id).catch(console.error);
+      syncCloudOrQueue({ userId: user.uid, type: 'delete_case', payload: { id } });
     }
   };
 
@@ -739,7 +1030,9 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         if (c.id !== id) return c;
         const updated = { ...c, isBookmarked: !c.isBookmarked, updatedAt: new Date().toISOString() };
         if (activeCaseStudy?.id === id) setActiveCaseStudy(updated);
-        if (user) saveCaseStudyToFirestore(user.uid, updated).catch(console.error);
+        if (user) {
+          syncCloudOrQueue({ userId: user.uid, type: 'upsert_case', payload: updated });
+        }
         return updated;
       })
     );
@@ -781,7 +1074,9 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           ...(prev.recentActivities || []),
         ].slice(0, 15),
       };
-      if (user) saveUserStatsToFirestore(user.uid, nextStats).catch(console.error);
+      if (user) {
+        syncCloudOrQueue({ userId: user.uid, type: 'save_stats', payload: nextStats });
+      }
       return nextStats;
     });
   };
@@ -827,13 +1122,15 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             ...(prev.recentActivities || []),
           ].slice(0, 15),
         };
-        if (user) saveUserStatsToFirestore(user.uid, nextStats).catch(console.error);
+        if (user) {
+          syncCloudOrQueue({ userId: user.uid, type: 'save_stats', payload: nextStats });
+        }
         return nextStats;
       });
     }
 
     if (user) {
-      savePodcastToFirestore(user.uid, stamped).catch(console.error);
+      syncCloudOrQueue({ userId: user.uid, type: 'upsert_podcast', payload: stamped });
     }
   };
 
@@ -847,7 +1144,7 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     });
     deletePodcastAudioBlob(id).catch(() => {});
     if (user) {
-      deletePodcastFromFirestore(user.uid, id).catch(console.error);
+      syncCloudOrQueue({ userId: user.uid, type: 'delete_podcast', payload: { id } });
     }
   };
 
@@ -857,7 +1154,9 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         if (p.id !== id) return p;
         const updated = { ...p, isBookmarked: !p.isBookmarked, updatedAt: new Date().toISOString() };
         if (activePodcast?.id === id) setActivePodcast(updated);
-        if (user) savePodcastToFirestore(user.uid, updated).catch(console.error);
+        if (user) {
+          syncCloudOrQueue({ userId: user.uid, type: 'upsert_podcast', payload: updated });
+        }
         return updated;
       })
     );
@@ -879,7 +1178,9 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           updatedAt: new Date().toISOString(),
         };
         if (activePodcast?.id === id) setActivePodcast(updated);
-        if (user) savePodcastToFirestore(user.uid, updated).catch(console.error);
+        if (user) {
+          syncCloudOrQueue({ userId: user.uid, type: 'upsert_podcast', payload: updated });
+        }
         return updated;
       })
     );
@@ -900,7 +1201,9 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             ...(prev.recentActivities || []),
           ].slice(0, 15),
         };
-        if (user) saveUserStatsToFirestore(user.uid, nextStats).catch(console.error);
+        if (user) {
+          syncCloudOrQueue({ userId: user.uid, type: 'save_stats', payload: nextStats });
+        }
         return nextStats;
       });
     }
@@ -973,10 +1276,17 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         isAuthModalOpen,
         setIsAuthModalOpen,
         authError,
+        authErrorDetails,
+        authRetryStatus,
         clearAuthError,
         user,
         isAuthLoading,
         isDbConnected,
+        isOnline,
+        isOfflineCacheReady,
+        lastOfflineCachedAt,
+        pendingOfflineSyncCount,
+        syncOfflineCacheNow,
         loginWithGoogle,
         logout,
       }}

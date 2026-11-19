@@ -4,8 +4,11 @@ import {
   GoogleAuthProvider,
   signInWithPopup,
   signOut as firebaseSignOut,
+  setPersistence,
+  browserLocalPersistence,
+  browserSessionPersistence,
+  inMemoryPersistence,
   User,
-  onAuthStateChanged,
 } from 'firebase/auth';
 import {
   getFirestore,
@@ -30,6 +33,129 @@ export const auth = getAuth(app);
 
 const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: 'select_account' });
+
+export type AuthErrorCategory =
+  | 'domain'
+  | 'popup'
+  | 'cancelled'
+  | 'network'
+  | 'config'
+  | 'account'
+  | 'unknown';
+
+export interface AuthErrorDetails {
+  code: string;
+  category: AuthErrorCategory;
+  message: string;
+  retryable: boolean;
+  hostname?: string;
+}
+
+export function classifyFirebaseAuthError(error: any): AuthErrorDetails {
+  const code = String(error?.code || '');
+  const hostname = typeof window !== 'undefined' ? window.location.hostname : '';
+
+  switch (code) {
+    case 'auth/unauthorized-domain':
+      return {
+        code,
+        category: 'domain',
+        hostname,
+        retryable: true,
+        message: `Domain "${hostname || 'current host'}" is not authorized for Firebase Authentication yet. Add it under Firebase Console → Authentication → Settings → Authorized domains, then retry.`,
+      };
+    case 'auth/popup-blocked':
+      return {
+        code,
+        category: 'popup',
+        hostname,
+        retryable: true,
+        message:
+          'Your browser or preview frame blocked the Google sign-in popup. Allow popups for this site or open the app in a full browser tab.',
+      };
+    case 'auth/popup-closed-by-user':
+      return {
+        code,
+        category: 'cancelled',
+        retryable: true,
+        message: 'The Google sign-in window was closed before completing sign-in.',
+      };
+    case 'auth/cancelled-popup-request':
+      return {
+        code,
+        category: 'cancelled',
+        retryable: true,
+        message: 'A sign-in popup request was superseded. Please try signing in again.',
+      };
+    case 'auth/network-request-failed':
+    case 'auth/internal-error':
+    case 'auth/too-many-requests':
+      return {
+        code,
+        category: 'network',
+        retryable: true,
+        message:
+          code === 'auth/too-many-requests'
+            ? 'Too many sign-in attempts in a short window. Please wait a few seconds and retry.'
+            : 'Network interruption while reaching Google Authentication. Please check your connection and retry.',
+      };
+    case 'auth/operation-not-allowed':
+      return {
+        code,
+        category: 'config',
+        retryable: false,
+        message:
+          'Google Sign-In provider is not enabled in Firebase Authentication Console for this project.',
+      };
+    case 'auth/operation-not-supported-in-this-environment':
+      return {
+        code,
+        category: 'popup',
+        hostname,
+        retryable: true,
+        message:
+          'This embedded environment restricts third-party storage or popups. Open the app in a full browser tab to sign in.',
+      };
+    case 'auth/user-disabled':
+    case 'auth/account-exists-with-different-credential':
+      return {
+        code,
+        category: 'account',
+        retryable: false,
+        message: error?.message || 'This account cannot be used to sign in right now.',
+      };
+    default:
+      return {
+        code: code || 'auth/unknown',
+        category: 'unknown',
+        retryable: true,
+        message:
+          error?.message ||
+          'Google sign-in could not be completed. Please try again.',
+      };
+  }
+}
+
+let persistenceInitialized = false;
+async function ensureAuthPersistence(): Promise<void> {
+  if (persistenceInitialized) return;
+  try {
+    await setPersistence(auth, browserLocalPersistence);
+    persistenceInitialized = true;
+  } catch {
+    try {
+      await setPersistence(auth, browserSessionPersistence);
+      persistenceInitialized = true;
+    } catch {
+      try {
+        await setPersistence(auth, inMemoryPersistence);
+        persistenceInitialized = true;
+      } catch {
+        // Proceed with Firebase default persistence if all overrides fail
+      }
+    }
+  }
+}
 
 export enum OperationType {
   CREATE = 'create',
@@ -113,14 +239,51 @@ export async function testConnection(): Promise<boolean> {
   }
 }
 
-// Auth actions
-export async function signInWithGoogle(): Promise<User | null> {
+const TRANSIENT_AUTH_RETRY_CODES = new Set([
+  'auth/network-request-failed',
+  'auth/internal-error',
+]);
+
+let activeSignInPromise: Promise<User | null> | null = null;
+
+// Auth actions (single-flight locked + transient network retry)
+export async function signInWithGoogle(options?: {
+  onRetryAttempt?: (attempt: number, maxAttempts: number) => void;
+}): Promise<User | null> {
+  if (activeSignInPromise) {
+    return activeSignInPromise;
+  }
+
+  activeSignInPromise = (async () => {
+    await ensureAuthPersistence();
+    const maxAttempts = 2;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const result = await signInWithPopup(auth, googleProvider);
+        return result.user;
+      } catch (error: any) {
+        const code = String(error?.code || '');
+        const shouldRetry =
+          attempt < maxAttempts && TRANSIENT_AUTH_RETRY_CODES.has(code);
+
+        if (shouldRetry) {
+          options?.onRetryAttempt?.(attempt + 1, maxAttempts);
+          await new Promise((resolve) => setTimeout(resolve, 450 * attempt));
+          continue;
+        }
+
+        console.error('Google Sign-In Error:', code || error?.message);
+        throw error;
+      }
+    }
+    return null;
+  })();
+
   try {
-    const result = await signInWithPopup(auth, googleProvider);
-    return result.user;
-  } catch (error: any) {
-    console.error('Google Sign-In Error:', error?.message);
-    throw error;
+    return await activeSignInPromise;
+  } finally {
+    activeSignInPromise = null;
   }
 }
 

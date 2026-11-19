@@ -38,6 +38,8 @@ const MainLayout: React.FC = () => {
     setIsUploadModalOpen,
     isExportPdfModalOpen,
     setIsExportPdfModalOpen,
+    isOnline,
+    savedPacks,
   } = useStudy();
 
   const renderActiveView = () => {
@@ -88,6 +90,13 @@ const MainLayout: React.FC = () => {
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col min-w-0 pb-16 lg:pb-0">
         <Navbar />
+
+        {!isOnline && (
+          <div className="bg-amber-50 dark:bg-amber-950/60 border-b border-amber-200 dark:border-amber-800/70 px-4 py-2 text-xs text-amber-900 dark:text-amber-200 text-center font-medium">
+            Offline Mode — Reading from your local IndexedDB library ({savedPacks.length} cached study{' '}
+            {savedPacks.length === 1 ? 'pack' : 'packs'}). Changes will sync automatically once reconnected.
+          </div>
+        )}
 
         <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8">
           {renderActiveView()}
